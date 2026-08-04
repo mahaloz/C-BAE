@@ -140,6 +140,11 @@ SMOKE_DIR=$smoke_dir python - <<'PY'
 import os
 from pathlib import Path
 
+import idapro  # noqa: F401
+import ida_registry
+
+ida_registry.reg_write_bool("EULA 90", True)
+
 from declib.api.decompiler_interface import DecompilerInterface
 
 root = Path(os.environ["SMOKE_DIR"])

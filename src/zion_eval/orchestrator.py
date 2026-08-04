@@ -128,6 +128,8 @@ class EvaluationRunConfig:
     decompiler_timeout_seconds: int = 21_600
     reverser_max_budget_usd: float | None = None
     grader_max_budget_usd: float | None = None
+    reverser_reasoning_effort: str | None = None
+    grader_reasoning_effort: str | None = None
     run_id: str | None = None
     resume: bool = False
 
@@ -143,6 +145,7 @@ class RegradeConfig:
     timeout_seconds: int = 21_600
     decompiler_timeout_seconds: int = 21_600
     grader_max_budget_usd: float | None = None
+    grader_reasoning_effort: str | None = None
 
 
 def provider_credential_name(provider: str) -> str:
@@ -154,6 +157,13 @@ def provider_credential_name(provider: str) -> str:
     raise OrchestrationError(
         f"unsupported provider {provider!r}; expected 'codex' or 'claude'"
     )
+
+
+def provider_environment_names(provider: str) -> list[str]:
+    normalized = provider.strip().lower()
+    if normalized == "codex" and os.environ.get("CODEX_AUTH_JSON"):
+        return ["CODEX_AUTH_JSON"]
+    return [provider_credential_name(provider)]
 
 
 def host_container_user() -> str:
@@ -346,11 +356,13 @@ def run_evaluation(config: EvaluationRunConfig) -> RunLayout:
             "provider": provider_display_name(config.reverser_provider),
             "model": config.reverser_model,
             "max_budget_usd": config.reverser_max_budget_usd,
+            "reasoning_effort": config.reverser_reasoning_effort,
         },
         "grader": {
             "provider": provider_display_name(config.grader_provider),
             "model": config.grader_model,
             "max_budget_usd": config.grader_max_budget_usd,
+            "reasoning_effort": config.grader_reasoning_effort,
         },
         "timeout_seconds": config.timeout_seconds,
         "decompiler_timeout_seconds": config.decompiler_timeout_seconds,
@@ -567,6 +579,7 @@ def regrade_evaluation(config: RegradeConfig) -> Path:
             "provider": provider_display_name(config.grader_provider),
             "model": config.grader_model,
             "max_budget_usd": config.grader_max_budget_usd,
+            "reasoning_effort": config.grader_reasoning_effort,
         },
         "timeout_seconds": config.timeout_seconds,
         "decompiler_timeout_seconds": config.decompiler_timeout_seconds,
@@ -589,6 +602,7 @@ def regrade_evaluation(config: RegradeConfig) -> Path:
             timeout_seconds=config.timeout_seconds,
             decompiler_timeout_seconds=config.decompiler_timeout_seconds,
             max_budget_usd=config.grader_max_budget_usd,
+            reasoning_effort=config.grader_reasoning_effort,
             project_seed=project_cache.state_seed if project_cache else None,
         )
         grade_attestation_path = grade_output / "attestation.json"
@@ -653,17 +667,21 @@ def _shared_decompiler_cache(manifest_path: Path) -> Path:
 
 
 def _require_provider_credentials(*providers: str) -> None:
-    missing = sorted(
-        {
-            provider_credential_name(provider)
-            for provider in providers
-            if not os.environ.get(provider_credential_name(provider))
-        }
-    )
+    missing: set[str] = set()
+    for provider in providers:
+        normalized = provider.strip().lower()
+        if normalized == "codex" and (
+            os.environ.get("CODEX_AUTH_JSON")
+            or os.environ.get(provider_credential_name(provider))
+        ):
+            continue
+        credential = provider_credential_name(provider)
+        if not os.environ.get(credential):
+            missing.add(credential)
     if missing:
         raise OrchestrationError(
             "missing required provider environment variable(s): "
-            + ", ".join(missing)
+            + ", ".join(sorted(missing))
         )
 
 
@@ -683,6 +701,14 @@ def _validate_run_options(
             raise OrchestrationError(f"{label} must be explicit")
     provider_display_name(config.reverser_provider)
     provider_display_name(config.grader_provider)
+    for label, effort in (
+        ("reverser reasoning effort", config.reverser_reasoning_effort),
+        ("grader reasoning effort", config.grader_reasoning_effort),
+    ):
+        if effort not in {None, "low", "medium", "high", "xhigh"}:
+            raise OrchestrationError(
+                f"{label} must be low, medium, high, or xhigh"
+            )
     if config.timeout_seconds <= 0 or config.decompiler_timeout_seconds <= 0:
         raise OrchestrationError("timeouts must be positive")
 
@@ -750,6 +776,8 @@ def _run_reverse_container(
         "--decompiler-timeout-seconds",
         str(config.decompiler_timeout_seconds),
     ]
+    if config.reverser_reasoning_effort is not None:
+        command.extend(("--reasoning-effort", config.reverser_reasoning_effort))
     if config.reverser_max_budget_usd is not None:
         command.extend(("--max-budget-usd", str(config.reverser_max_budget_usd)))
     with neutral_agent_staging(
@@ -763,7 +791,9 @@ def _run_reverse_container(
                 image=config.image,
                 command=command,
                 mounts=reverse_mounts(staging),
-                environment_names=[provider_credential_name(config.reverser_provider)],
+                environment_names=provider_environment_names(
+                    config.reverser_provider
+                ),
                 timeout_seconds=min(
                     _REVERSE_CONTAINER_TIMEOUT_SECONDS,
                     config.timeout_seconds
@@ -812,6 +842,7 @@ def _run_grade_container(
         timeout_seconds=config.timeout_seconds,
         decompiler_timeout_seconds=config.decompiler_timeout_seconds,
         max_budget_usd=config.grader_max_budget_usd,
+        reasoning_effort=config.grader_reasoning_effort,
         project_seed=project_seed,
     )
     return True
@@ -831,6 +862,7 @@ def _invoke_grade_container(
     timeout_seconds: int,
     decompiler_timeout_seconds: int,
     max_budget_usd: float | None,
+    reasoning_effort: str | None = None,
     project_seed: Path | None = None,
 ) -> None:
     command = [
@@ -856,6 +888,8 @@ def _invoke_grade_container(
         "--decompiler-timeout-seconds",
         str(decompiler_timeout_seconds),
     ]
+    if reasoning_effort is not None:
+        command.extend(("--reasoning-effort", reasoning_effort))
     if max_budget_usd is not None:
         command.extend(("--max-budget-usd", str(max_budget_usd)))
     with neutral_agent_staging(
@@ -880,7 +914,7 @@ def _invoke_grade_container(
                 image=image,
                 command=command,
                 mounts=mounts,
-                environment_names=[provider_credential_name(provider)],
+                environment_names=provider_environment_names(provider),
                 timeout_seconds=(
                     timeout_seconds + 2 * decompiler_timeout_seconds + 180
                 ),

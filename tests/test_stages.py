@@ -204,6 +204,9 @@ def test_reverse_stage_translates_declib_base_offset_and_cleans_up(tmp_path: Pat
                 "XDG_DATA_HOME": "/home/zion/.local/share",
                 "XDG_STATE_HOME": "/home/zion/.local/state",
                 "IDA_INSTALL_DIR": "/opt/idapro-9.2",
+                "CODEX_AUTH_JSON": json.dumps(
+                    {"auth_mode": "chatgpt", "tokens": {"access_token": "secret"}}
+                ),
                 "CODEX_API_KEY": "host-codex-secret",
                 "OPENAI_API_KEY": "only-for-provider",
                 "ANTHROPIC_API_KEY": "must-not-leak",
@@ -229,8 +232,13 @@ def test_reverse_stage_translates_declib_base_offset_and_cleans_up(tmp_path: Pat
     assert "SSH_AUTH_SOCK" not in provider.requests[0].environment
     assert "OPENAI_API_KEY" in provider.requests[0].environment
     assert "CODEX_API_KEY" in provider.requests[0].environment
+    assert "CODEX_AUTH_JSON" not in provider.requests[0].environment
     assert "OPENAI_API_KEY" not in controller.calls[0]["environment"]
     assert "CODEX_API_KEY" not in controller.calls[0]["environment"]
+    assert "CODEX_AUTH_JSON" not in controller.calls[0]["environment"]
+    assert json.loads(
+        (tmp_path / "state" / "home" / ".codex" / "auth.json").read_text()
+    )["auth_mode"] == "chatgpt"
     for environment in (
         provider.requests[0].environment,
         controller.calls[0]["environment"],

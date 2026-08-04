@@ -1,0 +1,14 @@
+--- a/declib/__main__.py
++++ b/declib/__main__.py
+@@ -13,6 +13,12 @@ def start_server(
+ ):
+     """Start the DecompilerServer (AF_UNIX socket-based)"""
+     try:
++        if decompiler == "ida":
++            import idapro  # noqa: F401
++            import ida_registry
++
++            ida_registry.reg_write_bool("EULA 90", True)
++
+         from declib.api.decompiler_server import DecompilerServer
+         from declib.api.decompiler_interface import DecompilerInterface

@@ -69,7 +69,9 @@ def test_codex_uses_noninteractive_schema_and_redacts_logs(tmp_path: Path) -> No
         )
 
     runner = CallbackRunner(complete)
-    result = CodexProvider("fake-codex", runner=runner).run(request(tmp_path))
+    result = CodexProvider("fake-codex", runner=runner).run(
+        request(tmp_path, reasoning_effort="high")
+    )
 
     spec = runner.specs[0]
     assert spec.stdin == "perform the evaluation"
@@ -93,6 +95,9 @@ def test_codex_uses_noninteractive_schema_and_redacts_logs(tmp_path: Path) -> No
         "standalone_web_search",
     } <= disabled
     assert spec.argv[spec.argv.index("--model") + 1] == "explicit-model-id"
+    assert spec.argv[spec.argv.index("--config") + 1] == (
+        'model_reasoning_effort="high"'
+    )
     assert secret not in " ".join(spec.argv)
     assert result.output == {"answer": "ok"}
     assert secret not in result.events_path.read_text(encoding="utf-8")

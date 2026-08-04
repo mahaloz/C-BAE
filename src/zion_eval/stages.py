@@ -143,6 +143,7 @@ class ReverseStageConfig:
     decompiler_executable: str = "decompiler"
     environment: Mapping[str, str] | None = None
     max_budget_usd: float | None = None
+    reasoning_effort: str | None = None
 
 
 @dataclass(frozen=True)
@@ -161,6 +162,7 @@ class GradeStageConfig:
     decompiler_executable: str = "decompiler"
     environment: Mapping[str, str] | None = None
     max_budget_usd: float | None = None
+    reasoning_effort: str | None = None
 
 
 @dataclass(frozen=True)
@@ -694,6 +696,7 @@ def run_reverse_stage(
                 timeout_seconds=config.timeout_seconds,
                 environment=provider_env,
                 max_budget_usd=config.max_budget_usd,
+                reasoning_effort=config.reasoning_effort,
             )
         )
         artifacts.update(_provider_artifacts(provider_result))
@@ -877,6 +880,7 @@ def run_grade_stage(
                 timeout_seconds=config.timeout_seconds,
                 environment=provider_env,
                 max_budget_usd=config.max_budget_usd,
+                reasoning_effort=config.reasoning_effort,
             )
         )
         artifacts.update(_provider_artifacts(provider_result))
@@ -1128,6 +1132,10 @@ def _validate_common_config(config: ReverseStageConfig | GradeStageConfig) -> No
         )
     if config.timeout_seconds <= 0 or config.decompiler_timeout_seconds <= 0:
         raise StageContractError("stage timeouts must be positive")
+    if config.reasoning_effort not in {None, "low", "medium", "high", "xhigh"}:
+        raise StageContractError(
+            "reasoning_effort must be low, medium, high, or xhigh"
+        )
     if isinstance(config.image_base, bool) or not isinstance(config.image_base, int):
         raise StageContractError("image_base must be an integer")
     if config.image_base < 0 or config.image_base >= 1 << 64:
@@ -1269,6 +1277,17 @@ def _prepare_layout(
     ida_user = secure_directory(state_root / "ida-user")
 
     base = dict(os.environ if supplied_environment is None else supplied_environment)
+    codex_auth_json = base.pop("CODEX_AUTH_JSON", None)
+    if codex_auth_json is not None:
+        try:
+            codex_auth = json.loads(codex_auth_json)
+            if not isinstance(codex_auth, dict):
+                raise TypeError("credential document is not an object")
+            atomic_write_json(codex_home / "auth.json", codex_auth)
+        except (TypeError, ValueError, OSError) as error:
+            raise StageContractError(
+                f"could not initialize Codex authentication: {error}"
+            ) from error
     ida_install_dir = base.get("IDA_INSTALL_DIR")
     if ida_install_dir:
         atomic_write_json(

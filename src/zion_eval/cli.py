@@ -141,6 +141,9 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_TIMEOUT_SECONDS,
     )
     regrade.add_argument("--grader-max-budget-usd", type=_positive_float)
+    regrade.add_argument(
+        "--grader-reasoning-effort", choices=("low", "medium", "high", "xhigh")
+    )
     regrade.set_defaults(handler=_regrade)
 
     batch = subparsers.add_parser("batch", help="run a JSON evaluation matrix")
@@ -174,6 +177,9 @@ def _add_stage_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--provider-executable")
     parser.add_argument("--decompiler-executable", default="decompiler")
     parser.add_argument("--max-budget-usd", type=_positive_float)
+    parser.add_argument(
+        "--reasoning-effort", choices=("low", "medium", "high", "xhigh")
+    )
 
 
 def _add_host_run_arguments(parser: argparse.ArgumentParser) -> None:
@@ -195,6 +201,12 @@ def _add_host_run_arguments(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--reverser-max-budget-usd", type=_positive_float)
     parser.add_argument("--grader-max-budget-usd", type=_positive_float)
+    parser.add_argument(
+        "--reverser-reasoning-effort", choices=("low", "medium", "high", "xhigh")
+    )
+    parser.add_argument(
+        "--grader-reasoning-effort", choices=("low", "medium", "high", "xhigh")
+    )
 
 
 def _targets(arguments: argparse.Namespace) -> int:
@@ -261,6 +273,7 @@ def _stage_reverse(arguments: argparse.Namespace) -> int:
             provider_executable=arguments.provider_executable,
             decompiler_executable=arguments.decompiler_executable,
             max_budget_usd=arguments.max_budget_usd,
+            reasoning_effort=arguments.reasoning_effort,
         )
     )
     print(json.dumps(result.to_dict(), indent=2, sort_keys=True))
@@ -283,6 +296,7 @@ def _stage_grade(arguments: argparse.Namespace) -> int:
             provider_executable=arguments.provider_executable,
             decompiler_executable=arguments.decompiler_executable,
             max_budget_usd=arguments.max_budget_usd,
+            reasoning_effort=arguments.reasoning_effort,
         )
     )
     print(json.dumps(result.to_dict(), indent=2, sort_keys=True))
@@ -321,6 +335,8 @@ def _run(arguments: argparse.Namespace) -> int:
             decompiler_timeout_seconds=arguments.decompiler_timeout_seconds,
             reverser_max_budget_usd=arguments.reverser_max_budget_usd,
             grader_max_budget_usd=arguments.grader_max_budget_usd,
+            reverser_reasoning_effort=arguments.reverser_reasoning_effort,
+            grader_reasoning_effort=arguments.grader_reasoning_effort,
             run_id=arguments.run_id,
             resume=arguments.resume,
         )
@@ -341,6 +357,7 @@ def _regrade(arguments: argparse.Namespace) -> int:
             timeout_seconds=arguments.timeout_seconds,
             decompiler_timeout_seconds=arguments.decompiler_timeout_seconds,
             grader_max_budget_usd=arguments.grader_max_budget_usd,
+            grader_reasoning_effort=arguments.grader_reasoning_effort,
         )
     )
     print(json.dumps({"status": "completed", "regrade_directory": str(root)}))
@@ -393,6 +410,10 @@ def _batch(arguments: argparse.Namespace) -> int:
                     ),
                     reverser_max_budget_usd=entry.get("reverser_max_budget_usd"),
                     grader_max_budget_usd=entry.get("grader_max_budget_usd"),
+                    reverser_reasoning_effort=entry.get(
+                        "reverser_reasoning_effort"
+                    ),
+                    grader_reasoning_effort=entry.get("grader_reasoning_effort"),
                     run_id=entry.get("run_id"),
                 )
             )

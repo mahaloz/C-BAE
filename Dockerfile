@@ -133,6 +133,9 @@ RUN python3.12 -m venv "${VIRTUAL_ENV}" && \
     python -m pip install --no-cache-dir --requirement /opt/zion-runtime/requirements.lock && \
     python -m pip install --no-cache-dir --no-deps "${IDA_INSTALL_DIR}/idalib/python" && \
     python -m pip check
+COPY docker/declib-ida.patch /opt/zion-runtime/declib-ida.patch
+RUN patch --directory="${VIRTUAL_ENV}/lib/python3.12/site-packages" --strip=1 \
+    </opt/zion-runtime/declib-ida.patch
 
 # Application dependencies are already pinned above. Disabling build isolation
 # prevents the build backend from fetching newer setuptools/wheel releases.

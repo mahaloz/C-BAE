@@ -188,6 +188,7 @@ class ProviderRequest:
     timeout_seconds: float = 21_600.0
     environment: Mapping[str, str] | None = None
     max_budget_usd: float | None = None
+    reasoning_effort: str | None = None
 
     def __post_init__(self) -> None:
         if not self.prompt.strip():
@@ -198,6 +199,8 @@ class ProviderRequest:
             raise ValueError("provider timeout must be positive")
         if self.max_budget_usd is not None and self.max_budget_usd <= 0:
             raise ValueError("max_budget_usd must be positive")
+        if self.reasoning_effort not in {None, "low", "medium", "high", "xhigh"}:
+            raise ValueError("reasoning_effort must be low, medium, high, or xhigh")
 
 
 @dataclass(frozen=True)
@@ -293,6 +296,12 @@ class CodexProvider(_BaseProvider):
         command_parts.extend((
             "--model",
             request.model,
+        ))
+        if request.reasoning_effort is not None:
+            command_parts.extend(
+                ("--config", f'model_reasoning_effort="{request.reasoning_effort}"')
+            )
+        command_parts.extend((
             "--cd",
             str(request.cwd),
             "--output-schema",

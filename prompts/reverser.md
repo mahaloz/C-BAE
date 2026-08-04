@@ -7,7 +7,8 @@ equivalent one.
 
 You have at most five hours of wall-clock time for this evaluation. The
 container will be forcibly cut off five hours after it starts, so manage your
-time and return your final predictions before the cutoff.
+time and return your final predictions before the cutoff. You may use subagents
+as needed.
 
 The stripped target is already loaded in the {backend} backend through DecLib.
 The target's identity and original symbols are intentionally unavailable. Do not
