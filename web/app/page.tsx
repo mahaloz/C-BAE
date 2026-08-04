@@ -64,7 +64,7 @@ export default function Home() {
 
           <div className="run-chart">
             {runs.map((run) => (
-              <Link className="run-chart-row" href={`/runs/${run.id}`} key={run.id}>
+              <Link className="run-chart-row" href={`/binaries/${run.id}`} key={run.id}>
                 <div className="run-label">
                   <strong>{run.displayName}</strong>
                   <span>{run.model} · {run.reasoningEffort} reasoning</span>
@@ -114,7 +114,7 @@ export default function Home() {
                 {runs.map((run) => (
                   <tr key={run.id}>
                     <td>
-                      <Link href={`/runs/${run.id}`}>
+                      <Link href={`/binaries/${run.id}`}>
                         <strong>{run.displayName}</strong>
                         <span>{run.binary.os} · {run.binary.architecture}</span>
                       </Link>
