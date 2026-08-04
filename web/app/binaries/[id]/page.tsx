@@ -91,7 +91,7 @@ export default async function RunDetail({ params }: PageProps) {
           <article>
             <span>Total time</span>
             <strong>{formatDuration(run.totalDurationSeconds)}</strong>
-            <p>{formatDuration(run.reverse.durationSeconds)} reverse · {formatDuration(run.grade.durationSeconds)} grade</p>
+            <p>{run.chooser ? `${formatDuration(run.chooser.durationSeconds)} choose · ` : ""}{formatDuration(run.reverse.durationSeconds)} reverse · {formatDuration(run.grade.durationSeconds)} grade</p>
           </article>
           <article>
             <span>Model</span>
@@ -103,7 +103,7 @@ export default async function RunDetail({ params }: PageProps) {
         <section className="audit-intro">
           <div>
             <p className="eyebrow">Selection audit</p>
-            <h2>Inspect the 100 functions the model chose</h2>
+            <h2>Inspect the 100 functions {run.chooser ? "the chooser selected" : "the model chose"}</h2>
           </div>
           <div className="audit-summary">
             <span><strong>{run.audit.preNamedSelections}</strong> pre-named</span>

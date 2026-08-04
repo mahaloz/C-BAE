@@ -282,6 +282,7 @@ def export_run(
     by_address = {item.get("rva"): item for item in snapshot_functions}
     score_by_address = {item.get("rva"): item for item in scores.get("items", [])}
 
+    chooser_events = read_events(run_dir / "chooser" / "provider" / "events.jsonl")
     reverse_events = read_events(run_dir / "reverse" / "provider" / "events.jsonl")
     records = command_records(reverse_events)
     selections: list[dict[str, Any]] = []
@@ -313,6 +314,11 @@ def export_run(
             }
         )
 
+    chooser = stage_data(
+        run_dir / "chooser" / "stage_result.json",
+        run_dir / "chooser" / "provider" / "events.jsonl",
+        costs,
+    )
     reverse = stage_data(
         run_dir / "reverse" / "stage_result.json",
         run_dir / "reverse" / "provider" / "events.jsonl",
@@ -323,7 +329,10 @@ def export_run(
         run_dir / "private" / "grade" / "provider" / "events.jsonl",
         costs,
     )
-    stage_costs = [stage.get("cost") for stage in (reverse, grade)]
+    configured_stages = (
+        (chooser, reverse, grade) if config.get("chooser") else (reverse, grade)
+    )
+    stage_costs = [stage.get("cost") for stage in configured_stages]
     known_costs = [cost for cost in stage_costs if cost]
     total_cost = (
         {
@@ -331,7 +340,7 @@ def export_run(
             "upperBound": sum(cost["upperBound"] for cost in known_costs),
             "kind": "API list-price equivalent",
         }
-        if len(known_costs) == 2
+        if len(known_costs) == len(configured_stages)
         else None
     )
     score_counts = scores.get("counts", {})
@@ -359,11 +368,14 @@ def export_run(
             "counts": score_counts,
             "submitted": int(scores.get("submitted_count", 0) or 0),
         },
+        "chooser": chooser if config.get("chooser") else None,
         "reverse": reverse,
         "grade": grade,
-        "totalDurationSeconds": reverse["durationSeconds"] + grade["durationSeconds"],
+        "totalDurationSeconds": sum(
+            stage["durationSeconds"] for stage in configured_stages
+        ),
         "cost": total_cost,
-        "tools": tool_summary(reverse_events),
+        "tools": tool_summary([*chooser_events, *reverse_events]),
         "audit": {
             "preNamedSelections": sum(1 for item in selections if item["wasPreNamed"]),
             "directDecompilationsCaptured": sum(
@@ -387,13 +399,32 @@ def build_dashboard(root: Path, runs_dir: Path) -> dict[str, Any]:
     manifest = load_manifest(root)
     costs = cost_index(runs_dir)
     decompilations = read_json(root / "web" / "data" / "decompilations.json", {})
-    runs = []
+    candidates = []
     for run_dir in sorted(runs_dir.iterdir()):
         if not run_dir.is_dir():
             continue
         exported = export_run(root, run_dir, manifest, costs, decompilations)
         if exported:
-            runs.append(exported)
+            candidates.append(exported)
+
+    # The dashboard is binary-oriented, not a historical run browser. Prefer
+    # the newest chooser pipeline for each target and otherwise keep the newest
+    # completed legacy run. Raw historical artifacts remain under runs/.
+    latest_by_target: dict[str, dict[str, Any]] = {}
+    for candidate in candidates:
+        target_id = candidate["targetId"]
+        current = latest_by_target.get(target_id)
+        candidate_rank = (
+            candidate.get("chooser") is not None,
+            candidate.get("grade", {}).get("finishedAt") or "",
+        )
+        current_rank = (
+            current.get("chooser") is not None,
+            current.get("grade", {}).get("finishedAt") or "",
+        ) if current else (False, "")
+        if current is None or candidate_rank > current_rank:
+            latest_by_target[target_id] = candidate
+    runs = sorted(latest_by_target.values(), key=lambda run: run["displayName"])
 
     total_predictions = sum(run["scores"]["submitted"] for run in runs)
     total_exact = sum(run["scores"]["counts"].get("exact", 0) for run in runs)

@@ -2,6 +2,9 @@
 set -euo pipefail
 
 mkdir -p "$HOME" "$XDG_STATE_HOME" "$XDG_CACHE_HOME" "$XDG_CONFIG_HOME"
+mkdir -p "$HOME/.idapro"
+printf '%s\n' '{"Paths":{"ida-install-dir":"/opt/idapro-9.2"}}' \
+    > "$HOME/.idapro/ida-config.json"
 
 echo "Loading BedRock IDA project..."
 bedrock_json=$(
@@ -53,7 +56,9 @@ python /scripts/backfill.py \
     --dashboard /output/dashboard.json \
     --cache /output/decompilations.json \
     --server "ida-gpt56-high-bedrock-20260804=$bedrock_id" \
+    --server "ida-chooser-gpt56-high-bedrock-20260804=$bedrock_id" \
     --server "ida-gpt56-high-mcchina-20260804=$mcchina_id" \
+    --server "ida-chooser-gpt56-high-mcchina-20260804=$mcchina_id" \
     --timeout-seconds 240 \
     --retry-errors
 

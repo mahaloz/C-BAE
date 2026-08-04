@@ -74,6 +74,7 @@ export type DashboardRun = {
     counts: Record<VerdictCategory | "gradeable", number>;
     submitted: number;
   };
+  chooser: Stage | null;
   reverse: Stage;
   grade: Stage;
   totalDurationSeconds: number;

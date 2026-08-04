@@ -33,12 +33,14 @@ test("renders the artifact-backed dataset overview", async () => {
   assert.doesNotMatch(html, /codex-preview|react-loading-skeleton/i);
 });
 
-test("renders a binary audit route", async () => {
-  const response = await render("/binaries/ida-gpt56-high-bedrock-20260804/");
+test("renders a chooser-pipeline binary audit route", async () => {
+  const response = await render("/binaries/ida-chooser-gpt56-high-bedrock-20260804/");
   assert.equal(response.status, 200);
   const html = await response.text();
-  assert.match(html, /Inspect the 100 functions the model chose/);
+  assert.match(html, /Inspect the 100 functions/);
+  assert.match(html, /the chooser selected/);
   assert.match(html, /Function recovery evaluation/);
   assert.match(html, /439,952/);
-  assert.match(html, /deflateInit_/);
+  assert.match(html, /46%/);
+  assert.match(html, /semantic accuracy/);
 });
