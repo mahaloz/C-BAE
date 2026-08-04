@@ -19,9 +19,11 @@ from .orchestrator import (
 )
 from .stages import (
     AnalysisStageConfig,
+    ChooserStageConfig,
     GradeStageConfig,
     ReverseStageConfig,
     run_analysis_stage,
+    run_chooser_stage,
     run_grade_stage,
     run_reverse_stage,
 )
@@ -83,10 +85,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     validate.set_defaults(handler=_validate)
 
+    stage_chooser = subparsers.add_parser(
+        "stage-chooser", help="internal chooser stage used by the container runtime"
+    )
+    _add_stage_arguments(stage_chooser)
+    stage_chooser.add_argument("--count", type=_positive_int, default=100)
+    stage_chooser.set_defaults(handler=_stage_chooser)
+
     stage_reverse = subparsers.add_parser(
         "stage-reverse", help="internal reverser stage used by the container runtime"
     )
     _add_stage_arguments(stage_reverse)
+    stage_reverse.add_argument("--selection", type=Path, required=True)
     stage_reverse.add_argument("--count", type=_positive_int, default=100)
     stage_reverse.set_defaults(handler=_stage_reverse)
 
@@ -115,7 +125,7 @@ def build_parser() -> argparse.ArgumentParser:
     stage_analyze.add_argument("--decompiler-executable", default="decompiler")
     stage_analyze.set_defaults(handler=_stage_analyze)
 
-    run = subparsers.add_parser("run", help="run one reverse-and-grade evaluation")
+    run = subparsers.add_parser("run", help="run one choose-reverse-grade evaluation")
     _add_host_run_arguments(run)
     run.add_argument("--target", required=True)
     run.add_argument("--count", type=_positive_int)
@@ -187,6 +197,8 @@ def _add_host_run_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--image", default=DEFAULT_IMAGE)
     parser.add_argument("--runs-dir", type=Path, default=Path("runs"))
     parser.add_argument("--backend", choices=("ida", "ghidra", "angr"))
+    parser.add_argument("--chooser-provider", choices=("codex", "claude"), required=True)
+    parser.add_argument("--chooser-model", required=True)
     parser.add_argument("--reverser-provider", choices=("codex", "claude"), required=True)
     parser.add_argument("--reverser-model", required=True)
     parser.add_argument("--grader-provider", choices=("codex", "claude"), required=True)
@@ -200,7 +212,11 @@ def _add_host_run_arguments(parser: argparse.ArgumentParser) -> None:
         default=DEFAULT_TIMEOUT_SECONDS,
     )
     parser.add_argument("--reverser-max-budget-usd", type=_positive_float)
+    parser.add_argument("--chooser-max-budget-usd", type=_positive_float)
     parser.add_argument("--grader-max-budget-usd", type=_positive_float)
+    parser.add_argument(
+        "--chooser-reasoning-effort", choices=("low", "medium", "high", "xhigh")
+    )
     parser.add_argument(
         "--reverser-reasoning-effort", choices=("low", "medium", "high", "xhigh")
     )
@@ -257,10 +273,34 @@ def _validate(arguments: argparse.Namespace) -> int:
     return 0
 
 
+def _stage_chooser(arguments: argparse.Namespace) -> int:
+    result = run_chooser_stage(
+        ChooserStageConfig(
+            binary_path=arguments.binary,
+            output_dir=arguments.output_dir,
+            provider_name=arguments.provider,
+            model=arguments.model,
+            state_dir=arguments.state_dir,
+            backend=arguments.backend,
+            count=arguments.count,
+            image_base=arguments.image_base,
+            timeout_seconds=arguments.timeout_seconds,
+            decompiler_timeout_seconds=arguments.decompiler_timeout_seconds,
+            provider_executable=arguments.provider_executable,
+            decompiler_executable=arguments.decompiler_executable,
+            max_budget_usd=arguments.max_budget_usd,
+            reasoning_effort=arguments.reasoning_effort,
+        )
+    )
+    print(json.dumps(result.to_dict(), indent=2, sort_keys=True))
+    return 0 if result.succeeded else 1
+
+
 def _stage_reverse(arguments: argparse.Namespace) -> int:
     result = run_reverse_stage(
         ReverseStageConfig(
             binary_path=arguments.binary,
+            selection_path=arguments.selection,
             output_dir=arguments.output_dir,
             provider_name=arguments.provider,
             model=arguments.model,
@@ -324,6 +364,8 @@ def _run(arguments: argparse.Namespace) -> int:
             manifest_path=arguments.manifest,
             target_id=arguments.target,
             image=arguments.image,
+            chooser_provider=arguments.chooser_provider,
+            chooser_model=arguments.chooser_model,
             reverser_provider=arguments.reverser_provider,
             reverser_model=arguments.reverser_model,
             grader_provider=arguments.grader_provider,
@@ -334,8 +376,10 @@ def _run(arguments: argparse.Namespace) -> int:
             timeout_seconds=arguments.timeout_seconds,
             decompiler_timeout_seconds=arguments.decompiler_timeout_seconds,
             reverser_max_budget_usd=arguments.reverser_max_budget_usd,
+            chooser_max_budget_usd=arguments.chooser_max_budget_usd,
             grader_max_budget_usd=arguments.grader_max_budget_usd,
             reverser_reasoning_effort=arguments.reverser_reasoning_effort,
+            chooser_reasoning_effort=arguments.chooser_reasoning_effort,
             grader_reasoning_effort=arguments.grader_reasoning_effort,
             run_id=arguments.run_id,
             resume=arguments.resume,
@@ -383,6 +427,8 @@ def _batch(arguments: argparse.Namespace) -> int:
         entry = {**defaults, **raw}
         required = (
             "target",
+            "chooser_provider",
+            "chooser_model",
             "reverser_provider",
             "reverser_model",
             "grader_provider",
@@ -397,6 +443,8 @@ def _batch(arguments: argparse.Namespace) -> int:
                     manifest_path=arguments.manifest,
                     target_id=str(entry["target"]),
                     image=str(entry.get("image", arguments.image)),
+                    chooser_provider=str(entry["chooser_provider"]),
+                    chooser_model=str(entry["chooser_model"]),
                     reverser_provider=str(entry["reverser_provider"]),
                     reverser_model=str(entry["reverser_model"]),
                     grader_provider=str(entry["grader_provider"]),
@@ -409,10 +457,12 @@ def _batch(arguments: argparse.Namespace) -> int:
                         entry.get("decompiler_timeout_seconds", DEFAULT_TIMEOUT_SECONDS)
                     ),
                     reverser_max_budget_usd=entry.get("reverser_max_budget_usd"),
+                    chooser_max_budget_usd=entry.get("chooser_max_budget_usd"),
                     grader_max_budget_usd=entry.get("grader_max_budget_usd"),
                     reverser_reasoning_effort=entry.get(
                         "reverser_reasoning_effort"
                     ),
+                    chooser_reasoning_effort=entry.get("chooser_reasoning_effort"),
                     grader_reasoning_effort=entry.get("grader_reasoning_effort"),
                     run_id=entry.get("run_id"),
                 )

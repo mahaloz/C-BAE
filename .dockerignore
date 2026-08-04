@@ -29,3 +29,5 @@ originals
 stripped
 mapping.toml
 tests
+web/node_modules
+web/.next

@@ -26,10 +26,12 @@ from .artifacts import (
     sha256_file,
 )
 from .prompts import (
+    build_chooser_prompt,
     build_grader_prompt,
     build_reverse_prompt,
     grading_packet_schema,
     prediction_schema,
+    selection_schema,
     verdict_schema,
 )
 from .providers import (
@@ -129,6 +131,26 @@ class StageResult:
 
 @dataclass(frozen=True)
 class ReverseStageConfig:
+    binary_path: Path
+    selection_path: Path
+    output_dir: Path
+    provider_name: str
+    model: str
+    state_dir: Path | None = None
+    backend: str = "ida"
+    count: int = 100
+    image_base: int = 0
+    timeout_seconds: float = 21_600.0
+    decompiler_timeout_seconds: float = 3_600.0
+    provider_executable: str | None = None
+    decompiler_executable: str = "decompiler"
+    environment: Mapping[str, str] | None = None
+    max_budget_usd: float | None = None
+    reasoning_effort: str | None = None
+
+
+@dataclass(frozen=True)
+class ChooserStageConfig:
     binary_path: Path
     output_dir: Path
     provider_name: str
@@ -425,6 +447,43 @@ class DeclibSession:
             ) from error
         return tuple(functions)
 
+    def decompile_text(self, address: str) -> str:
+        """Return raw pseudocode for one exact DecLib function address."""
+
+        if self._closed:
+            raise DecompilerError("DecLib session is already closed")
+        command = (
+            self.controller.executable,
+            "decompile",
+            address,
+            "--id",
+            self.server_id,
+            "--raw",
+        )
+        try:
+            completed = self.controller.runner.run(
+                CommandSpec(
+                    argv=command,
+                    stdin=None,
+                    cwd=self.cwd,
+                    env=self.environment,
+                    timeout_seconds=self.timeout_seconds,
+                )
+            )
+        except CommandTimedOut as error:
+            raise DecompilerError(
+                f"DecLib decompilation of {address} exceeded the "
+                f"{self.timeout_seconds:g}s timeout"
+            ) from error
+        if completed.returncode != 0:
+            raise DecompilerError(
+                f"DecLib decompilation of {address} exited with status "
+                f"{completed.returncode}: {completed.stderr[-1000:].strip()}"
+            )
+        if not completed.stdout.strip():
+            raise DecompilerError(f"DecLib returned empty decompilation for {address}")
+        return completed.stdout
+
     def save(self) -> None:
         if self._closed:
             raise DecompilerError("DecLib session is already closed")
@@ -587,6 +646,168 @@ def run_analysis_stage(
     )
 
 
+def run_chooser_stage(
+    config: ChooserStageConfig,
+    *,
+    provider_adapter: ProviderAdapter | None = None,
+    decompiler_controller: DeclibController | None = None,
+) -> StageResult:
+    """Select and objectively validate the immutable reverser task set."""
+
+    started_at = _utc_now()
+    started = time.monotonic()
+    output_dir = secure_directory(config.output_dir)
+    artifacts: dict[str, str] = {}
+    provider_result: ProviderResult | None = None
+    produced_count = 0
+    error: Exception | None = None
+    session: DeclibSession | Any | None = None
+
+    try:
+        _validate_common_config(config)
+        workspace, provider_dir, project_dir, provider_env, decompiler_env = _prepare_layout(
+            output_dir, config.state_dir, config.provider_name, config.environment
+        )
+        decompiler_binary = _stage_decompiler_binary(
+            config.binary_path, project_dir.parent
+        )
+        controller = decompiler_controller or DeclibController(
+            executable=config.decompiler_executable
+        )
+        session = controller.open(
+            binary_path=decompiler_binary,
+            backend=config.backend,
+            project_dir=project_dir,
+            environment=decompiler_env,
+            timeout_seconds=config.decompiler_timeout_seconds,
+        )
+        functions = tuple(session.list_functions())
+        _validate_seeded_analysis(
+            project_dir.parent,
+            functions,
+            binary_path=decompiler_binary,
+            binary_base=session.binary_base_addr,
+            backend=config.backend,
+        )
+        if len(functions) < config.count:
+            raise StageContractError(
+                f"DecLib discovered {len(functions)} functions, fewer than the "
+                f"requested {config.count}"
+            )
+        translation = _build_address_translation(
+            functions,
+            decompiler_base=session.binary_base_addr,
+            image_base=config.image_base,
+        )
+        snapshot_path = output_dir / "function_snapshot.json"
+        snapshot_document = _snapshot_document(config, session, translation)
+        atomic_write_json(snapshot_path, snapshot_document)
+        agent_catalog = _agent_catalog(translation)
+        atomic_write_json(workspace / "function_catalog.json", agent_catalog)
+        artifacts["function_snapshot"] = str(snapshot_path)
+
+        schema = selection_schema(config.count)
+        schema_path = output_dir / "selection_schema.json"
+        atomic_write_json(schema_path, schema)
+        artifacts["output_schema"] = str(schema_path)
+        prompt = build_chooser_prompt(config.count, session.server_id, config.backend)
+        prompt_path = output_dir / "prompt.txt"
+        atomic_write_text(prompt_path, prompt)
+        artifacts["prompt"] = str(prompt_path)
+
+        adapter = provider_adapter or make_provider(
+            config.provider_name, executable=config.provider_executable
+        )
+        if adapter.name != _canonical_provider_name(config.provider_name):
+            raise StageContractError(
+                f"injected provider {adapter.name!r} does not match requested provider "
+                f"{config.provider_name!r}"
+            )
+        provider_result = adapter.run(
+            ProviderRequest(
+                prompt=prompt,
+                model=config.model,
+                output_schema=schema,
+                cwd=workspace,
+                artifact_dir=provider_dir,
+                timeout_seconds=config.timeout_seconds,
+                environment=provider_env,
+                max_budget_usd=config.max_budget_usd,
+                reasoning_effort=config.reasoning_effort,
+            )
+        )
+        artifacts.update(_provider_artifacts(provider_result))
+
+        atomic_write_json(snapshot_path, snapshot_document)
+        atomic_write_json(schema_path, schema)
+        atomic_write_text(prompt_path, prompt)
+        raw_addresses = _validate_chooser_selections(
+            provider_result.output,
+            translation.raw_to_rva,
+            expected_count=config.count,
+        )
+        snapshot_by_raw = {
+            str(entry["decompiler_address"]): entry
+            for entry in translation.snapshot_functions
+        }
+        selected: list[dict[str, Any]] = []
+        too_short: list[str] = []
+        for raw_address in raw_addresses:
+            line_count = _meaningful_decompilation_line_count(
+                session.decompile_text(raw_address)
+            )
+            if line_count <= 5:
+                too_short.append(f"{raw_address} ({line_count} meaningful lines)")
+            entry = snapshot_by_raw[raw_address]
+            selected.append(
+                {
+                    "rva": entry["rva"],
+                    "submitted_address": raw_address,
+                    "size": entry["size"],
+                    "decompiled_line_count": line_count,
+                }
+            )
+        if too_short:
+            raise StageContractError(
+                "chooser selected functions with five or fewer meaningful code lines: "
+                + ", ".join(too_short)
+            )
+        selected_document = {
+            "schema_version": 1,
+            "address_space": "rva",
+            "count": config.count,
+            "functions": selected,
+        }
+        selected_path = output_dir / "selected_functions.json"
+        atomic_write_json(selected_path, selected_document)
+        artifacts["selected_functions"] = str(selected_path)
+        produced_count = len(selected)
+    except Exception as caught:
+        error = caught
+    finally:
+        if session is not None:
+            try:
+                session.close(discard=True)
+            except Exception as cleanup_error:
+                if error is None:
+                    error = cleanup_error
+                else:
+                    error = StageError(f"{error}; additionally, cleanup failed: {cleanup_error}")
+
+    return _finish_stage(
+        stage="choose",
+        config=config,
+        started_at=started_at,
+        started=started,
+        output_dir=output_dir,
+        artifacts=artifacts,
+        provider_result=provider_result,
+        requested_count=config.count,
+        produced_count=produced_count,
+        error=error,
+    )
+
+
 def run_reverse_stage(
     config: ReverseStageConfig,
     *,
@@ -641,32 +862,40 @@ def run_reverse_stage(
             image_base=config.image_base,
         )
         snapshot_path = output_dir / "function_snapshot.json"
-        snapshot_document = {
-            "schema_version": 1,
-            "address_space": "rva",
-            "image_base": config.image_base,
-            "decompiler_base": session.binary_base_addr,
-            "backend": config.backend,
-            "functions": list(translation.snapshot_functions),
-        }
+        snapshot_document = _snapshot_document(config, session, translation)
         atomic_write_json(snapshot_path, snapshot_document)
         # Give the agent a local, explicitly bounded-query catalog so a large
         # list_functions response does not have to enter model context. Expose
         # only one address convention: the exact DecLib address submissions
         # accept, never the host-only canonical RVA.
-        agent_catalog = {
+        agent_catalog = _agent_catalog(translation)
+        atomic_write_json(workspace / "function_catalog.json", agent_catalog)
+        selected_rvas = _load_selected_rvas(config.selection_path, config.count)
+        try:
+            required_raw_addresses = tuple(
+                translation.rva_to_raw[rva] for rva in selected_rvas
+            )
+        except KeyError as selection_error:
+            raise StageContractError(
+                f"selected RVA {selection_error.args[0]} is absent from the reverser snapshot"
+            ) from selection_error
+        snapshot_by_raw = {
+            str(entry["decompiler_address"]): entry
+            for entry in translation.snapshot_functions
+        }
+        selected_for_agent = {
             "schema_version": 1,
             "address_space": "declib",
             "functions": [
                 {
-                    "address": entry["decompiler_address"],
-                    "size": entry["size"],
-                    "discovered_name": entry["discovered_name"],
+                    "address": address,
+                    "size": snapshot_by_raw[address]["size"],
+                    "discovered_name": snapshot_by_raw[address]["discovered_name"],
                 }
-                for entry in translation.snapshot_functions
+                for address in required_raw_addresses
             ],
         }
-        atomic_write_json(workspace / "function_catalog.json", agent_catalog)
+        atomic_write_json(workspace / "selected_functions.json", selected_for_agent)
         artifacts["function_snapshot"] = str(snapshot_path)
 
         schema = prediction_schema(config.count)
@@ -712,6 +941,7 @@ def run_reverse_stage(
                 provider_result.output,
                 translation.raw_to_rva,
                 expected_count=config.count,
+                required_raw_addresses=required_raw_addresses,
             )
         except Exception as validation_error:
             raise StageContractError(
@@ -946,6 +1176,36 @@ def run_grade_stage(
     )
 
 
+def _snapshot_document(
+    config: ChooserStageConfig | ReverseStageConfig,
+    session: DeclibSession | Any,
+    translation: _AddressTranslation,
+) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "address_space": "rva",
+        "image_base": config.image_base,
+        "decompiler_base": session.binary_base_addr,
+        "backend": config.backend,
+        "functions": list(translation.snapshot_functions),
+    }
+
+
+def _agent_catalog(translation: _AddressTranslation) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "address_space": "declib",
+        "functions": [
+            {
+                "address": entry["decompiler_address"],
+                "size": entry["size"],
+                "discovered_name": entry["discovered_name"],
+            }
+            for entry in translation.snapshot_functions
+        ],
+    }
+
+
 def _build_address_translation(
     functions: Sequence[FunctionInfo],
     *,
@@ -1027,6 +1287,7 @@ def _validate_reverse_predictions(
     raw_to_rva: Mapping[str, str],
     *,
     expected_count: int,
+    required_raw_addresses: Sequence[str],
 ) -> tuple[Prediction, ...]:
     if set(output) != {"predictions"}:
         raise StageContractError(
@@ -1085,7 +1346,133 @@ def _validate_reverse_predictions(
         predictions.append(
             Prediction(rva=rva, name=name, submitted_address=address)
         )
+    required = set(required_raw_addresses)
+    submitted = set(seen_rvas.values())
+    if submitted != required:
+        missing = sorted(required - submitted, key=parse_address)
+        unexpected = sorted(submitted - required, key=parse_address)
+        raise StageContractError(
+            "reverse output does not match the chooser's immutable address set; "
+            f"missing={missing}, unexpected={unexpected}"
+        )
     return tuple(predictions)
+
+
+def _validate_chooser_selections(
+    output: Mapping[str, Any],
+    raw_to_rva: Mapping[str, str],
+    *,
+    expected_count: int,
+) -> tuple[str, ...]:
+    if set(output) != {"selections"}:
+        raise StageContractError("chooser output must contain only the 'selections' field")
+    items = output.get("selections")
+    if not isinstance(items, list):
+        raise StageContractError("chooser output selections must be an array")
+    if len(items) != expected_count:
+        raise StageContractError(
+            f"chooser output has {len(items)} selections; expected exactly {expected_count}"
+        )
+    selected: list[str] = []
+    seen_values: dict[int, str] = {}
+    for position, item in enumerate(items):
+        if not isinstance(item, Mapping) or set(item) != {"address"}:
+            raise StageContractError(
+                f"selections[{position}] must contain only address"
+            )
+        address = item.get("address")
+        if not isinstance(address, str):
+            raise StageContractError(f"selections[{position}].address must be a string")
+        try:
+            value = parse_address(address)
+        except Exception as error:
+            raise StageContractError(
+                f"selections[{position}].address is invalid: {error}"
+            ) from error
+        if value in seen_values:
+            raise StageContractError(
+                f"duplicate selected DecLib addresses {seen_values[value]!r} and {address!r}"
+            )
+        seen_values[value] = address
+        if address not in raw_to_rva:
+            raise StageContractError(
+                f"selected DecLib address {address} is not an exact address from the "
+                "pre-agent function snapshot"
+            )
+        selected.append(address)
+    return tuple(selected)
+
+
+def _meaningful_decompilation_line_count(text: str) -> int:
+    """Count body-like pseudocode lines, excluding formatting and comments."""
+
+    count = 0
+    in_block_comment = False
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if in_block_comment:
+            if "*/" in line:
+                in_block_comment = False
+                line = line.split("*/", 1)[1].strip()
+            else:
+                continue
+        if line.startswith("/*"):
+            if "*/" not in line[2:]:
+                in_block_comment = True
+                continue
+            line = line.split("*/", 1)[1].strip()
+        if not line or line in {"{", "}"} or line.startswith("//"):
+            continue
+        # IDA/Ghidra put the function declaration directly before the opening
+        # brace. It is structure, not a body statement.
+        if line.endswith("{") or ("(" in line and ")" in line and not line.endswith(";")):
+            continue
+        count += 1
+    return count
+
+
+def _load_selected_rvas(path: Path, expected_count: int) -> tuple[str, ...]:
+    try:
+        document = decode_strict_json(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError) as error:
+        raise StageContractError(f"could not read chooser selection: {error}") from error
+    except Exception as error:
+        raise StageContractError(f"invalid chooser selection JSON: {error}") from error
+    if not isinstance(document, Mapping) or set(document) != {
+        "schema_version",
+        "address_space",
+        "count",
+        "functions",
+    }:
+        raise StageContractError("chooser selection has an invalid top-level contract")
+    if document.get("schema_version") != 1 or document.get("address_space") != "rva":
+        raise StageContractError("chooser selection must use schema version 1 and RVA space")
+    if document.get("count") != expected_count:
+        raise StageContractError("chooser selection count does not match reverse count")
+    functions = document.get("functions")
+    if not isinstance(functions, list) or len(functions) != expected_count:
+        raise StageContractError("chooser selection has the wrong number of functions")
+    rvas: list[str] = []
+    for position, entry in enumerate(functions):
+        if not isinstance(entry, Mapping) or set(entry) != {
+            "rva",
+            "submitted_address",
+            "size",
+            "decompiled_line_count",
+        }:
+            raise StageContractError(f"chooser selection functions[{position}] is invalid")
+        rva = entry.get("rva")
+        lines = entry.get("decompiled_line_count")
+        if not isinstance(rva, str) or canonical_rva(parse_address(rva)) != rva:
+            raise StageContractError(f"chooser selection functions[{position}].rva is invalid")
+        if isinstance(lines, bool) or not isinstance(lines, int) or lines <= 5:
+            raise StageContractError(
+                f"chooser selection functions[{position}] does not exceed five code lines"
+            )
+        rvas.append(rva)
+    if len(set(rvas)) != len(rvas):
+        raise StageContractError("chooser selection contains duplicate RVAs")
+    return tuple(rvas)
 
 
 def _load_grading_packet(path: Path) -> dict[str, Any]:
@@ -1120,7 +1507,9 @@ def _validate_analysis_config(config: AnalysisStageConfig) -> None:
         raise StageContractError("decompiler timeout must be positive")
 
 
-def _validate_common_config(config: ReverseStageConfig | GradeStageConfig) -> None:
+def _validate_common_config(
+    config: ChooserStageConfig | ReverseStageConfig | GradeStageConfig,
+) -> None:
     if not config.binary_path.is_file():
         raise StageContractError("binary_path must identify a regular file")
     if not config.model.strip():
@@ -1140,9 +1529,11 @@ def _validate_common_config(config: ReverseStageConfig | GradeStageConfig) -> No
         raise StageContractError("image_base must be an integer")
     if config.image_base < 0 or config.image_base >= 1 << 64:
         raise StageContractError("image_base must be an unsigned 64-bit value")
-    if isinstance(config, ReverseStageConfig):
+    if isinstance(config, (ChooserStageConfig, ReverseStageConfig)):
         if isinstance(config.count, bool) or not isinstance(config.count, int) or config.count <= 0:
-            raise StageContractError("reverse count must be a positive integer")
+            raise StageContractError("function count must be a positive integer")
+    if isinstance(config, ReverseStageConfig) and not config.selection_path.is_file():
+        raise StageContractError("selection_path must identify the chooser output")
 
 
 def _analysis_metadata(
@@ -1374,7 +1765,7 @@ def _canonical_provider_name(name: str) -> str:
 def _finish_stage(
     *,
     stage: str,
-    config: ReverseStageConfig | GradeStageConfig | AnalysisStageConfig,
+    config: ChooserStageConfig | ReverseStageConfig | GradeStageConfig | AnalysisStageConfig,
     started_at: str,
     started: float,
     output_dir: Path,

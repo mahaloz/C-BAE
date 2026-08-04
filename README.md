@@ -1,9 +1,10 @@
 # Closed Binary Agent Evalation (C-BAE) 
 
 This repository evaluates how well an LLM can recover useful original-style
-function names from a large stripped binary. A reverser chooses functions and
-names them from static-analysis evidence; an independent grader compares those
-names with private ground truth and may inspect the same stripped binary.
+function names from a large stripped binary. A chooser first freezes a set of
+binary-specific, substantive functions; an isolated reverser names that exact
+set from static-analysis evidence; and an independent grader compares those
+names with private ground truth.
 
 The default benchmark asks for 100 functions and reports two scores:
 
@@ -12,9 +13,10 @@ The default benchmark asks for 100 functions and reports two scores:
 - **Semantic accuracy**: exact matches plus names that the grader judges to have
   the same qualified role and operation.
 
-The reverser and grader run in separate containers. The reverser receives only
-a generically named, read-only binary staged beneath a randomized neutral host
-path; the symbol sidecar and truth index are never mounted into that container.
+The chooser, reverser, and grader run in separate containers. The reverser
+receives only a generically named, read-only binary and the chooser's address-only
+selection staged beneath a randomized neutral host path; chooser reasoning, the
+symbol sidecar, and the truth index are never mounted into that container.
 The neutral staging layer also prevents `/proc/*/mountinfo` from revealing the
 original binary, target, run, or repository path.
 
@@ -65,6 +67,8 @@ export ANTHROPIC_API_KEY=...
   --manifest mapping.toml \
   --target bedrock-server-linux-1.21.0.03 \
   --image zion-function-eval:local \
+  --chooser-provider codex \
+  --chooser-model MODEL_ID \
   --reverser-provider codex \
   --reverser-model MODEL_ID \
   --grader-provider claude \
@@ -78,18 +82,18 @@ for an explicitly selected fallback; the framework never silently changes
 decompiler backends. Use `zion-eval run --help` for timeout, Claude budget,
 output-directory, and resume controls.
 
-The command creates a unique directory beneath `runs/`. Public reverser output
-and aggregate scores are separate from `private/`, which contains selected
-ground truth and grader logs. A failed stage is recorded and is not silently
-repaired. The mutable image tag is resolved to an immutable Docker image ID,
-and prediction/snapshot/verdict hashes are locked for safe resume and regrade.
-Frozen predictions can be graded again with `zion-eval regrade`.
+The command creates a unique directory beneath `runs/`. Public chooser and
+reverser output and aggregate scores are separate from `private/`, which contains
+selected ground truth and grader logs. Each stage and the chooser-to-reverser
+address set are independently attested. A failed stage is recorded and is not
+silently repaired. Frozen predictions can be graded again with `zion-eval
+regrade`.
 
 Agent homes and writable decompiler projects live in ephemeral neutral stage
 storage and are discarded after output recovery; completed and failed stages
 never resume agent-mutated state. For IDA Pro and Ghidra, a credential-free
 container first builds and closes one pristine analyzed project in the owner-only,
-content-addressed `.zion-eval/decompiler-cache/`. Reverse, grade, and regrade
+content-addressed `.zion-eval/decompiler-cache/`. Choose, reverse, grade, and regrade
 receive independent regular-file copies beneath their randomized neutral
 `/state`; the canonical cache path is never mounted, and stage state is never
 promoted back into it. The key commits to the binary hash, exact runtime image
@@ -107,6 +111,8 @@ Batch runs use a versioned JSON matrix:
 {
   "schema_version": 1,
   "defaults": {
+    "chooser_provider": "codex",
+    "chooser_model": "MODEL_ID",
     "reverser_provider": "codex",
     "reverser_model": "MODEL_ID",
     "grader_provider": "claude",
@@ -176,8 +182,12 @@ does not require loading the complete mapping into memory.
 
 ## Benchmark policy
 
-- The reverser selects exactly `N` DecLib-discovered function starts and may
-  inspect other functions while deciding.
+- The chooser selects exactly `N` DecLib-discovered function starts. Each must
+  have more than five meaningful pseudocode lines, must not be a stub or generic
+  copied library routine, and should be distinctive to the target binary. The
+  harness objectively re-decompiles and checks the line-count minimum.
+- The reverser must name exactly the chooser's frozen address set. It may inspect
+  other functions for context but cannot substitute easier functions.
 - Target identity is blinded, although strings naturally present in the binary
   remain available evidence.
 - Codex browser, computer-use, web-search, app, and remote-plugin features are

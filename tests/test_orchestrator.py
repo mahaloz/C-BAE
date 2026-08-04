@@ -67,6 +67,8 @@ def _evaluation_config(tmp_path: Path, *, target_id: str, run_id: str) -> Evalua
         manifest_path=tmp_path / "manifest.toml",
         target_id=target_id,
         image="zion-eval:test",
+        chooser_provider="codex",
+        chooser_model="chooser-model",
         reverser_provider="codex",
         reverser_model="reverse-model",
         grader_provider="claude",
@@ -95,6 +97,8 @@ def test_reverse_container_command_and_mountinfo_sources_are_identity_blind(
     cached_project.mkdir(parents=True)
     (cached_project / "database").write_text("pristine", encoding="utf-8")
     config = _evaluation_config(tmp_path, target_id=target_id, run_id=run_id)
+    selection_path = tmp_path / "selection.json"
+    selection_path.write_text("{}", encoding="utf-8")
     config = replace(
         config,
         timeout_seconds=10_000,
@@ -113,11 +117,12 @@ def test_reverse_container_command_and_mountinfo_sources_are_identity_blind(
             mount.destination: mount for mount in spec.mounts  # type: ignore[attr-defined]
         }
         assert by_destination["/input/target"].read_only is True
+        assert by_destination["/input/selection.json"].read_only is True
         assert by_destination["/output"].read_only is False
         assert by_destination["/state"].read_only is False
         assert by_destination["/input/target"].source.read_bytes() == b"binary"
         assert {path.name for path in (spec.mount_source_root / "input").iterdir()} == {  # type: ignore[attr-defined]
-            "target"
+            "target", "grading_packet.json"
         }
         staged_database = by_destination["/state"].source / "decompiler-project" / "database"
         assert staged_database.read_text(encoding="utf-8") == "pristine"
@@ -135,7 +140,8 @@ def test_reverse_container_command_and_mountinfo_sources_are_identity_blind(
 
     monkeypatch.setattr("zion_eval.orchestrator.run_container", fake_run)
     _run_reverse_container(
-        config, binary, 0, 1, "ghidra", layout, project_seed=project_seed
+        config, binary, 0, 1, "ghidra", layout,
+        selection_path=selection_path, project_seed=project_seed
     )
 
     command_text = "\0".join(captured["command"])  # type: ignore[arg-type]
@@ -169,6 +175,8 @@ def test_reverse_copyback_runs_when_container_launch_raises(
     binary.write_bytes(b"binary")
     layout = RunLayout.create(tmp_path / "runs", "target", "run-on-failure")
     config = _evaluation_config(tmp_path, target_id="target", run_id="run-on-failure")
+    selection_path = tmp_path / "selection.json"
+    selection_path.write_text("{}", encoding="utf-8")
     captured_root: Path | None = None
     monkeypatch.setattr("zion_eval.orchestrator.host_container_user", lambda: "123:456")
 
@@ -190,7 +198,9 @@ def test_reverse_copyback_runs_when_container_launch_raises(
         "zion_eval.orchestrator.run_container", fail_after_partial_output
     )
     with pytest.raises(DockerRunError, match="simulated Docker failure"):
-        _run_reverse_container(config, binary, 0, 1, "angr", layout)
+        _run_reverse_container(
+            config, binary, 0, 1, "angr", layout, selection_path=selection_path
+        )
 
     assert (layout.reverse_output / "partial.log").read_text() == "partial"
     assert not (layout.reverse_state / "partial-state").exists()
@@ -205,6 +215,8 @@ def test_reverse_nonzero_exit_copies_failure_artifacts_before_status_check(
     binary.write_bytes(b"binary")
     layout = RunLayout.create(tmp_path / "runs", "target", "nonzero-run")
     config = _evaluation_config(tmp_path, target_id="target", run_id="nonzero-run")
+    selection_path = tmp_path / "selection.json"
+    selection_path.write_text("{}", encoding="utf-8")
     captured_root: Path | None = None
     monkeypatch.setenv("CODEX_API_KEY", "test-key")
     monkeypatch.setattr("zion_eval.orchestrator.host_container_user", lambda: "123:456")
@@ -227,7 +239,9 @@ def test_reverse_nonzero_exit_copies_failure_artifacts_before_status_check(
 
     monkeypatch.setattr("zion_eval.orchestrator.run_container", nonzero_result)
     with pytest.raises(OrchestrationError, match="exited with 17"):
-        _run_reverse_container(config, binary, 0, 1, "angr", layout)
+        _run_reverse_container(
+            config, binary, 0, 1, "angr", layout, selection_path=selection_path
+        )
 
     assert (layout.reverse_output / "provider-events.jsonl").read_text() == "partial event"
     assert (layout.reverse_output / "container.stderr.log").read_text() == "failure stderr"
@@ -445,6 +459,19 @@ image_base = 0
             }
         ],
     }
+    selected = {
+        "schema_version": 1,
+        "address_space": "rva",
+        "count": 1,
+        "functions": [
+            {
+                "rva": "0x10",
+                "submitted_address": "0x10",
+                "size": 4,
+                "decompiled_line_count": 7,
+            }
+        ],
+    }
     verdicts = {
         "0x10": {
             "verdict": "equivalent",
@@ -476,13 +503,29 @@ image_base = 0
         fake_ensure_cache,
     )
 
-    def fake_reverse(
+    def fake_chooser(
         config, _binary, _base, _count, _backend, layout, *, project_seed=None
+    ):
+        launched_images.append(config.image)
+        if (layout.chooser_output / "stage_result.json").exists():
+            return False
+        assert project_seed == cache_seed
+        atomic_write_json(layout.chooser_output / "function_snapshot.json", snapshot)
+        atomic_write_json(layout.chooser_output / "selected_functions.json", selected)
+        atomic_write_json(
+            layout.chooser_output / "stage_result.json", {"status": "completed"}
+        )
+        return True
+
+    def fake_reverse(
+        config, _binary, _base, _count, _backend, layout, *,
+        selection_path, project_seed=None
     ):
         launched_images.append(config.image)
         if (layout.reverse_output / "stage_result.json").exists():
             return False
         assert project_seed == cache_seed
+        assert json.loads(selection_path.read_text(encoding="utf-8")) == selected
         atomic_write_json(layout.reverse_output / "function_snapshot.json", snapshot)
         atomic_write_json(
             layout.reverse_output / "predictions.json",
@@ -511,6 +554,7 @@ image_base = 0
         )
         return True
 
+    monkeypatch.setattr("zion_eval.orchestrator._run_chooser_container", fake_chooser)
     monkeypatch.setattr("zion_eval.orchestrator._run_reverse_container", fake_reverse)
     monkeypatch.setattr("zion_eval.orchestrator._run_grade_container", fake_grade)
 
@@ -518,6 +562,8 @@ image_base = 0
         manifest_path=manifest,
         target_id="fixture",
         image="zion-eval:test",
+        chooser_provider="codex",
+        chooser_model="chooser-v1",
         reverser_provider="codex",
         reverser_model="reverse-v1",
         grader_provider="claude",

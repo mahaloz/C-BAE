@@ -1,4 +1,4 @@
-"""Trusted host orchestration and reverse/grader filesystem separation."""
+"""Trusted host orchestration and chooser/reverser/grader isolation."""
 
 from __future__ import annotations
 
@@ -42,7 +42,7 @@ class OrchestrationError(RuntimeError):
 
 
 _RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
-_REVERSE_CONTAINER_TIMEOUT_SECONDS = 5 * 60 * 60
+_AGENT_CONTAINER_TIMEOUT_SECONDS = 5 * 60 * 60
 
 
 def _validated_run_id(value: str) -> str:
@@ -56,6 +56,8 @@ def _validated_run_id(value: str) -> str:
 @dataclass(frozen=True, slots=True)
 class RunLayout:
     root: Path
+    chooser_output: Path
+    chooser_state: Path
     reverse_output: Path
     reverse_state: Path
     private: Path
@@ -81,6 +83,8 @@ class RunLayout:
         secure_directory(root)
         layout = cls(
             root=root,
+            chooser_output=root / "chooser",
+            chooser_state=root / "state" / "chooser",
             reverse_output=root / "reverse",
             reverse_state=root / "state" / "reverse",
             private=root / "private",
@@ -88,6 +92,8 @@ class RunLayout:
             grade_state=root / "private" / "state" / "grade",
         )
         for directory in (
+            layout.chooser_output,
+            layout.chooser_state,
             layout.reverse_output,
             layout.reverse_state,
             layout.private,
@@ -104,6 +110,8 @@ class RunLayout:
             raise OrchestrationError(f"run path is not a directory: {resolved}")
         return cls(
             root=resolved,
+            chooser_output=resolved / "chooser",
+            chooser_state=resolved / "state" / "chooser",
             reverse_output=resolved / "reverse",
             reverse_state=resolved / "state" / "reverse",
             private=resolved / "private",
@@ -117,6 +125,8 @@ class EvaluationRunConfig:
     manifest_path: Path
     target_id: str
     image: str
+    chooser_provider: str
+    chooser_model: str
     reverser_provider: str
     reverser_model: str
     grader_provider: str
@@ -126,8 +136,10 @@ class EvaluationRunConfig:
     backend: str | None = None
     timeout_seconds: int = 21_600
     decompiler_timeout_seconds: int = 21_600
+    chooser_max_budget_usd: float | None = None
     reverser_max_budget_usd: float | None = None
     grader_max_budget_usd: float | None = None
+    chooser_reasoning_effort: str | None = None
     reverser_reasoning_effort: str | None = None
     grader_reasoning_effort: str | None = None
     run_id: str | None = None
@@ -181,13 +193,15 @@ def host_container_user() -> str:
 
 
 def reverse_mounts(staging: NeutralStagePaths) -> tuple[BindMount, ...]:
-    """Return the complete reverser mount set from one neutral staging root."""
+    """Return an agent mount set from one neutral staging root."""
 
-    mounts = (
+    mounts: tuple[BindMount, ...] = (
         BindMount(staging.binary, "/input/target", read_only=True),
         BindMount(staging.output, "/output", read_only=False),
         BindMount(staging.state, "/state", read_only=False),
     )
+    if staging.packet is not None:
+        mounts += (BindMount(staging.packet, "/input/selection.json", read_only=True),)
     neutral_root = staging.root.resolve(strict=True)
     for mount in mounts:
         source = mount.source.resolve(strict=True)
@@ -254,7 +268,7 @@ def write_run_configuration(layout: RunLayout, document: Mapping[str, Any]) -> P
 
 
 def run_evaluation(config: EvaluationRunConfig) -> RunLayout:
-    """Run or resume one complete two-container evaluation."""
+    """Run or resume one complete chooser/reverser/grader evaluation."""
 
     manifest = load_manifest(config.manifest_path)
     target = manifest.get_target(config.target_id)
@@ -263,6 +277,7 @@ def run_evaluation(config: EvaluationRunConfig) -> RunLayout:
     _validate_run_options(config, count=count, backend=backend)
 
     layout: RunLayout | None = None
+    chooser_status: str | None = None
     reverse_status: str | None = None
     grade_status: str | None = None
     frozen_project_cache_config: Any = None
@@ -272,8 +287,13 @@ def run_evaluation(config: EvaluationRunConfig) -> RunLayout:
         layout = RunLayout.open(
             config.runs_directory / _validated_run_id(config.run_id)
         )
+        chooser_status = _stage_status(layout.chooser_output / "stage_result.json")
         reverse_status = _stage_status(layout.reverse_output / "stage_result.json")
         grade_status = _stage_status(layout.grade_output / "stage_result.json")
+        if chooser_status not in {None, "completed"}:
+            raise OrchestrationError(
+                "a failed chooser stage is immutable; start a new run instead"
+            )
         if reverse_status not in {None, "completed"}:
             raise OrchestrationError(
                 "a failed reverse stage is immutable; start a new run instead"
@@ -289,6 +309,8 @@ def run_evaluation(config: EvaluationRunConfig) -> RunLayout:
             "decompiler_project_cache"
         )
         required_providers: list[str] = []
+        if chooser_status is None:
+            required_providers.append(config.chooser_provider)
         if reverse_status is None:
             required_providers.append(config.reverser_provider)
         if reverse_status in {None, "completed"} and grade_status is None:
@@ -296,7 +318,7 @@ def run_evaluation(config: EvaluationRunConfig) -> RunLayout:
         _require_provider_credentials(*required_providers)
     else:
         _require_provider_credentials(
-            config.reverser_provider, config.grader_provider
+            config.chooser_provider, config.reverser_provider, config.grader_provider
         )
 
     runtime_image = inspect_docker_image(config.image)
@@ -310,6 +332,7 @@ def run_evaluation(config: EvaluationRunConfig) -> RunLayout:
     project_cache: ProjectCacheEntry | None = None
     needs_decompiler = not (
         config.resume
+        and chooser_status == "completed"
         and reverse_status == "completed"
         and grade_status == "completed"
     )
@@ -338,7 +361,7 @@ def run_evaluation(config: EvaluationRunConfig) -> RunLayout:
         project_cache_configuration = frozen_project_cache_config
 
     configuration = {
-        "schema_version": 1,
+        "schema_version": 2,
         "target_id": target.id,
         "manifest_sha256": sha256_file(manifest.path),
         "binary_sha256": target.binary_sha256,
@@ -352,6 +375,12 @@ def run_evaluation(config: EvaluationRunConfig) -> RunLayout:
         "image": config.image,
         "runtime_image": runtime_image,
         "decompiler_project_cache": project_cache_configuration,
+        "chooser": {
+            "provider": provider_display_name(config.chooser_provider),
+            "model": config.chooser_model,
+            "max_budget_usd": config.chooser_max_budget_usd,
+            "reasoning_effort": config.chooser_reasoning_effort,
+        },
         "reverser": {
             "provider": provider_display_name(config.reverser_provider),
             "model": config.reverser_model,
@@ -373,6 +402,30 @@ def run_evaluation(config: EvaluationRunConfig) -> RunLayout:
     runtime_config = replace(config, image=runtime_image["image_id"])
 
     try:
+        chooser_launched = _run_chooser_container(
+            runtime_config,
+            target.binary_path,
+            target.image_base,
+            count,
+            backend,
+            layout,
+            project_seed=project_cache.state_seed if project_cache else None,
+        )
+        chooser_attestation_path = layout.chooser_output / "attestation.json"
+        write_or_verify_attestation(
+            chooser_attestation_path,
+            kind="chooser",
+            files={
+                "function_snapshot": layout.chooser_output / "function_snapshot.json",
+                "selected_functions": layout.chooser_output / "selected_functions.json",
+            },
+            context={
+                "configuration_sha256": configuration_sha256,
+                "binary_sha256": target.binary_sha256,
+                "runtime_image_id": runtime_image["image_id"],
+            },
+            allow_create=chooser_launched,
+        )
         reverse_launched = _run_reverse_container(
             runtime_config,
             target.binary_path,
@@ -380,6 +433,7 @@ def run_evaluation(config: EvaluationRunConfig) -> RunLayout:
             count,
             backend,
             layout,
+            selection_path=layout.chooser_output / "selected_functions.json",
             project_seed=project_cache.state_seed if project_cache else None,
         )
         reverse_attestation_path = layout.reverse_output / "attestation.json"
@@ -394,6 +448,7 @@ def run_evaluation(config: EvaluationRunConfig) -> RunLayout:
             context={
                 "configuration_sha256": configuration_sha256,
                 "binary_sha256": target.binary_sha256,
+                "chooser_attestation_sha256": sha256_file(chooser_attestation_path),
                 "runtime_image_id": runtime_image["image_id"],
             },
             allow_create=reverse_launched,
@@ -438,6 +493,9 @@ def run_evaluation(config: EvaluationRunConfig) -> RunLayout:
                     "configuration_sha256": configuration_sha256,
                     "binary_sha256": target.binary_sha256,
                     "truth_sha256": target.truth_sha256,
+                    "chooser_attestation_sha256": sha256_file(
+                        chooser_attestation_path
+                    ),
                     "reverse_attestation_sha256": sha256_file(
                         reverse_attestation_path
                     ),
@@ -463,6 +521,9 @@ def run_evaluation(config: EvaluationRunConfig) -> RunLayout:
                 "status": "completed",
                 "run_id": layout.root.name,
                 "configuration_sha256": configuration_sha256,
+                "chooser_attestation_sha256": sha256_file(
+                    chooser_attestation_path
+                ),
                 "reverse_attestation_sha256": sha256_file(
                     reverse_attestation_path
                 ),
@@ -531,6 +592,26 @@ def regrade_evaluation(config: RegradeConfig) -> Path:
             container_user=host_container_user(),
         )
     original_configuration_sha256 = canonical_json_sha256(original)
+    chooser_context: dict[str, str] = {}
+    if original.get("schema_version") == 2:
+        chooser_attestation_path = layout.chooser_output / "attestation.json"
+        write_or_verify_attestation(
+            chooser_attestation_path,
+            kind="chooser",
+            files={
+                "function_snapshot": layout.chooser_output / "function_snapshot.json",
+                "selected_functions": layout.chooser_output / "selected_functions.json",
+            },
+            context={
+                "configuration_sha256": original_configuration_sha256,
+                "binary_sha256": target.binary_sha256,
+                "runtime_image_id": original_runtime["image_id"],
+            },
+            allow_create=False,
+        )
+        chooser_context["chooser_attestation_sha256"] = sha256_file(
+            chooser_attestation_path
+        )
     reverse_attestation_path = layout.reverse_output / "attestation.json"
     write_or_verify_attestation(
         reverse_attestation_path,
@@ -544,6 +625,7 @@ def regrade_evaluation(config: RegradeConfig) -> Path:
             "configuration_sha256": original_configuration_sha256,
             "binary_sha256": target.binary_sha256,
             "runtime_image_id": original_runtime["image_id"],
+            **chooser_context,
         },
         allow_create=False,
     )
@@ -693,15 +775,18 @@ def _validate_run_options(
     if backend not in {"ida", "ghidra", "angr"}:
         raise OrchestrationError("backend must be 'ida', 'ghidra', or 'angr'")
     for label, value in (
+        ("chooser model", config.chooser_model),
         ("reverser model", config.reverser_model),
         ("grader model", config.grader_model),
         ("image", config.image),
     ):
         if not value.strip():
             raise OrchestrationError(f"{label} must be explicit")
+    provider_display_name(config.chooser_provider)
     provider_display_name(config.reverser_provider)
     provider_display_name(config.grader_provider)
     for label, effort in (
+        ("chooser reasoning effort", config.chooser_reasoning_effort),
         ("reverser reasoning effort", config.reverser_reasoning_effort),
         ("grader reasoning effort", config.grader_reasoning_effort),
     ):
@@ -741,6 +826,7 @@ def _run_reverse_container(
     count: int,
     backend: str,
     layout: RunLayout,
+    selection_path: Path,
     project_seed: Path | None = None,
 ) -> bool:
     result_path = layout.reverse_output / "stage_result.json"
@@ -761,6 +847,8 @@ def _run_reverse_container(
         "/output",
         "--state-dir",
         "/state",
+        "--selection",
+        "/input/selection.json",
         "--provider",
         provider_display_name(config.reverser_provider),
         "--model",
@@ -784,6 +872,7 @@ def _run_reverse_container(
         binary_path=binary_path,
         output_dir=layout.reverse_output,
         state_dir=layout.reverse_state,
+        packet_path=selection_path,
         state_seed=project_seed,
     ) as staging:
         result = run_container(
@@ -795,7 +884,7 @@ def _run_reverse_container(
                     config.reverser_provider
                 ),
                 timeout_seconds=min(
-                    _REVERSE_CONTAINER_TIMEOUT_SECONDS,
+                    _AGENT_CONTAINER_TIMEOUT_SECONDS,
                     config.timeout_seconds
                     + 2 * config.decompiler_timeout_seconds
                     + 180,
@@ -807,6 +896,80 @@ def _run_reverse_container(
         )
     _persist_container_result(layout.reverse_output, result)
     _require_completed_stage(result_path, result.returncode, "reverse")
+    return True
+
+
+def _run_chooser_container(
+    config: EvaluationRunConfig,
+    binary_path: Path,
+    image_base: int,
+    count: int,
+    backend: str,
+    layout: RunLayout,
+    project_seed: Path | None = None,
+) -> bool:
+    result_path = layout.chooser_output / "stage_result.json"
+    status = _stage_status(result_path)
+    if status == "completed":
+        if not config.resume:
+            raise OrchestrationError("chooser stage already exists without --resume")
+        return False
+    if status is not None:
+        raise OrchestrationError(
+            "a failed chooser stage is immutable; start a new run instead"
+        )
+    command = [
+        "stage-chooser",
+        "--binary",
+        "/input/target",
+        "--output-dir",
+        "/output",
+        "--state-dir",
+        "/state",
+        "--provider",
+        provider_display_name(config.chooser_provider),
+        "--model",
+        config.chooser_model,
+        "--backend",
+        backend,
+        "--count",
+        str(count),
+        "--image-base",
+        f"0x{image_base:x}",
+        "--timeout-seconds",
+        str(config.timeout_seconds),
+        "--decompiler-timeout-seconds",
+        str(config.decompiler_timeout_seconds),
+    ]
+    if config.chooser_reasoning_effort is not None:
+        command.extend(("--reasoning-effort", config.chooser_reasoning_effort))
+    if config.chooser_max_budget_usd is not None:
+        command.extend(("--max-budget-usd", str(config.chooser_max_budget_usd)))
+    with neutral_agent_staging(
+        binary_path=binary_path,
+        output_dir=layout.chooser_output,
+        state_dir=layout.chooser_state,
+        state_seed=project_seed,
+    ) as staging:
+        result = run_container(
+            ContainerSpec(
+                image=config.image,
+                command=command,
+                mounts=reverse_mounts(staging),
+                environment_names=provider_environment_names(config.chooser_provider),
+                timeout_seconds=min(
+                    _AGENT_CONTAINER_TIMEOUT_SECONDS,
+                    config.timeout_seconds
+                    + 2 * config.decompiler_timeout_seconds
+                    + 180,
+                ),
+                raise_on_failure=False,
+                user=host_container_user(),
+                mount_source_root=staging.root,
+            )
+        )
+    _persist_container_result(layout.chooser_output, result)
+    _require_completed_stage(result_path, result.returncode, "chooser")
     return True
 
 

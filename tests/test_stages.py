@@ -13,11 +13,13 @@ from zion_eval.artifacts import (
 from zion_eval.providers import CommandSpec, CompletedCommand, ProviderRequest, ProviderResult
 from zion_eval.stages import (
     AnalysisStageConfig,
+    ChooserStageConfig,
     DeclibController,
     FunctionInfo,
     GradeStageConfig,
     ReverseStageConfig,
     run_analysis_stage,
+    run_chooser_stage,
     run_grade_stage,
     run_reverse_stage,
 )
@@ -68,6 +70,9 @@ class FakeSession:
     def save(self) -> None:
         self.saved = True
 
+    def decompile_text(self, address: str) -> str:
+        return "int selected() {\n  int a = 1;\n  a += 2;\n  a += 3;\n  a += 4;\n  a += 5;\n  a += 6;\n  return a;\n}\n"
+
     def close(self, *, discard: bool = False) -> None:
         self.closed = True
         self.discarded = discard
@@ -93,6 +98,28 @@ FUNCTIONS = (
 def binary(tmp_path: Path) -> Path:
     path = tmp_path / "target"
     path.write_bytes(b"binary fixture")
+    return path
+
+
+def selection(tmp_path: Path, *rvas: str) -> Path:
+    path = tmp_path / f"selection-{len(list(tmp_path.glob('selection-*')))}.json"
+    atomic_write_json(
+        path,
+        {
+            "schema_version": 1,
+            "address_space": "rva",
+            "count": len(rvas),
+            "functions": [
+                {
+                    "rva": rva,
+                    "submitted_address": rva,
+                    "size": 20,
+                    "decompiled_line_count": 7,
+                }
+                for rva in rvas
+            ],
+        },
+    )
     return path
 
 
@@ -157,6 +184,7 @@ def test_seeded_analysis_mismatch_fails_before_provider_and_discards_clone(
     result = run_reverse_stage(
         ReverseStageConfig(
             binary_path=source,
+            selection_path=selection(tmp_path, "0x10"),
             output_dir=tmp_path / "reverse",
             state_dir=state,
             provider_name="codex",
@@ -175,6 +203,60 @@ def test_seeded_analysis_mismatch_fails_before_provider_and_discards_clone(
     assert controller.session.discarded is True
 
 
+def test_chooser_freezes_only_substantive_addresses_and_records_line_counts(
+    tmp_path: Path,
+) -> None:
+    provider = FakeProvider(
+        "codex",
+        {"selections": [{"address": "0x10"}, {"address": "0x30"}]},
+    )
+    controller = FakeController(FUNCTIONS)
+    result = run_chooser_stage(
+        ChooserStageConfig(
+            binary_path=binary(tmp_path),
+            output_dir=tmp_path / "chooser",
+            provider_name="codex",
+            model="chooser-model",
+            count=2,
+        ),
+        provider_adapter=provider,
+        decompiler_controller=controller,
+    )
+
+    assert result.succeeded
+    chosen = json.loads(Path(result.artifacts["selected_functions"]).read_text())
+    assert [item["rva"] for item in chosen["functions"]] == ["0x10", "0x30"]
+    assert all(item["decompiled_line_count"] > 5 for item in chosen["functions"])
+    assert all("name" not in item for item in chosen["functions"])
+    prompt = Path(result.artifacts["prompt"]).read_text()
+    assert "not merely a generic library" in prompt
+    assert "comparatively distinctive to this binary" in prompt
+    assert "more than five meaningful code lines" in prompt
+
+
+def test_chooser_rejects_a_selected_five_line_function(tmp_path: Path) -> None:
+    provider = FakeProvider("codex", {"selections": [{"address": "0x10"}]})
+    controller = FakeController(FUNCTIONS)
+    controller.session.decompile_text = lambda _address: (  # type: ignore[method-assign]
+        "int f() {\n  a();\n  b();\n  c();\n  d();\n  return 0;\n}\n"
+    )
+    result = run_chooser_stage(
+        ChooserStageConfig(
+            binary_path=binary(tmp_path),
+            output_dir=tmp_path / "chooser-short",
+            provider_name="codex",
+            model="chooser-model",
+            count=1,
+        ),
+        provider_adapter=provider,
+        decompiler_controller=controller,
+    )
+
+    assert not result.succeeded
+    assert "five or fewer meaningful code lines" in (result.error_message or "")
+    assert "selected_functions" not in result.artifacts
+
+
 def test_reverse_stage_translates_declib_base_offset_and_cleans_up(tmp_path: Path) -> None:
     provider = FakeProvider(
         "codex",
@@ -191,6 +273,7 @@ def test_reverse_stage_translates_declib_base_offset_and_cleans_up(tmp_path: Pat
     result = run_reverse_stage(
         ReverseStageConfig(
             binary_path=source_binary,
+            selection_path=selection(tmp_path, "0x1010", "0x1020"),
             output_dir=tmp_path / "reverse",
             provider_name="codex",
             model="gpt-explicit",
@@ -309,6 +392,7 @@ def test_reverse_contract_failure_is_persisted_and_cleanup_still_runs(tmp_path: 
     result = run_reverse_stage(
         ReverseStageConfig(
             binary_path=binary(tmp_path),
+            selection_path=selection(tmp_path, "0x10"),
             output_dir=tmp_path / "failed",
             provider_name="claude",
             model="claude-explicit",
@@ -327,6 +411,27 @@ def test_reverse_contract_failure_is_persisted_and_cleanup_still_runs(tmp_path: 
     assert "predictions" not in document["artifacts"]
 
 
+def test_reverse_rejects_substitution_for_chooser_address(tmp_path: Path) -> None:
+    provider = FakeProvider(
+        "codex", {"predictions": [{"address": "0x20", "name": "easier_guess"}]}
+    )
+    result = run_reverse_stage(
+        ReverseStageConfig(
+            binary_path=binary(tmp_path),
+            selection_path=selection(tmp_path, "0x10"),
+            output_dir=tmp_path / "substitution",
+            provider_name="codex",
+            model="reverse-model",
+            count=1,
+        ),
+        provider_adapter=provider,
+        decompiler_controller=FakeController(FUNCTIONS),
+    )
+
+    assert not result.succeeded
+    assert "immutable address set" in (result.error_message or "")
+
+
 def test_reverse_rejects_impossible_count_before_provider(tmp_path: Path) -> None:
     provider = FakeProvider("codex", {"predictions": []})
     controller = FakeController(FUNCTIONS[:1])
@@ -334,6 +439,7 @@ def test_reverse_rejects_impossible_count_before_provider(tmp_path: Path) -> Non
     result = run_reverse_stage(
         ReverseStageConfig(
             binary_path=binary(tmp_path),
+            selection_path=selection(tmp_path, "0x10", "0x20"),
             output_dir=tmp_path / "too-many",
             provider_name="codex",
             model="gpt-explicit",
@@ -358,6 +464,7 @@ def test_reverse_rejects_address_translation_underflow(tmp_path: Path) -> None:
     result = run_reverse_stage(
         ReverseStageConfig(
             binary_path=binary(tmp_path),
+            selection_path=selection(tmp_path, "0x10"),
             output_dir=tmp_path / "underflow",
             provider_name="codex",
             model="gpt-explicit",
@@ -388,6 +495,7 @@ def test_reverse_rejects_duplicate_raw_prediction_addresses(tmp_path: Path) -> N
     result = run_reverse_stage(
         ReverseStageConfig(
             binary_path=binary(tmp_path),
+            selection_path=selection(tmp_path, "0x10", "0x20"),
             output_dir=tmp_path / "duplicates",
             provider_name="codex",
             model="gpt-explicit",
@@ -415,6 +523,7 @@ def test_reverse_rejects_duplicate_declib_snapshot_addresses(tmp_path: Path) -> 
     result = run_reverse_stage(
         ReverseStageConfig(
             binary_path=binary(tmp_path),
+            selection_path=selection(tmp_path, "0x10"),
             output_dir=tmp_path / "duplicate-snapshot",
             provider_name="codex",
             model="gpt-explicit",
