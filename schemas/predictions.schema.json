@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Strict function-name predictions (set min/maxItems to N)",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["predictions"],
+  "properties": {
+    "predictions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["address", "name"],
+        "properties": {
+          "address": {"type": "string", "pattern": "^0x[0-9a-fA-F]+$"},
+          "name": {"type": "string", "minLength": 1, "maxLength": 32768}
+        }
+      }
+    }
+  }
+}

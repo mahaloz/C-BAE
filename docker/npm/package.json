@@ -1,0 +1,11 @@
+{
+  "name": "zion-eval-agent-clis",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Pinned model CLI dependencies for the zion-eval image",
+  "license": "UNLICENSED",
+  "dependencies": {
+    "@anthropic-ai/claude-code": "2.1.220",
+    "@openai/codex": "0.146.0"
+  }
+}

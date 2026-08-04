@@ -1,0 +1,27 @@
+schema_version = 1
+
+[defaults]
+function_count = 100
+decompiler_backend = "ida"
+
+[[targets]]
+id = "bedrock-server-linux-1.21.0.03"
+binary = "stripped/binary1"
+truth = "originals/minecraft_bedrock_server_linux_1.21.0.03/bedrock_server.json"
+binary_sha256 = "9f205849d4fe757b4e50affd909ba377eddef6bb0f4f112c5fd23211091f4699"
+truth_sha256 = "50d0436c666ea1c7136b173163cc4bab5233d82914ef8f5b7e209728795e5aa4"
+format = "elf"
+architecture = "x86_64"
+truth_address_space = "va"
+image_base = 0x0
+
+[[targets]]
+id = "minecraft-china-client-windows-1.16.201"
+binary = "stripped/binary2.exe"
+truth = "originals/minecraft_china_client_windows_1.16.201/win_mc_rebuilt.exe.json"
+binary_sha256 = "263ec3063e6e6fcbdcff23cbe5a39a27dba10e6b3a7e60029253aa2bca59bfd8"
+truth_sha256 = "c51b2915e5f58c6a8194bf8cb09a4a9ae645ab088c01e55a18c17690d4f1cd2e"
+format = "pe"
+architecture = "x86_64"
+truth_address_space = "va"
+image_base = 0x140000000

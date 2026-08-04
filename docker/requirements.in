@@ -1,0 +1,14 @@
+# Runtime decompiler backends. Keep these top-level versions in sync with the
+# image labels and docker/smoke-test.sh.
+declib==4.4.1
+pyghidra==3.1.0
+angr==9.2.213
+# Match angr's pinned optional accelerator and avoid falling back noisily.
+unicorn==2.1.4
+
+# zion-eval runtime dependency. The compiled lock pins this range exactly.
+jsonschema>=4.23,<5
+
+# Reproducible project installation without an isolated build environment.
+pip==26.2
+wheel==0.47.0

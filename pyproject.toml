@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=75", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "zion-function-eval"
+version = "0.1.0"
+description = "Blind function-name recovery evaluation harness for large binaries"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "Zion Function Evaluation Authors" }]
+dependencies = [
+  "jsonschema>=4.23,<5",
+  "tomli>=2.0.1; python_version < '3.11'",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.3,<9",
+]
+
+[project.scripts]
+zion-eval = "zion_eval.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+zion_eval = ["py.typed"]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+testpaths = ["tests"]

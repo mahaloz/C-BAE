@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Private semantic grading packet",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "entries"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "entries": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["address", "predicted_name", "authoritative_names", "gradable"],
+        "properties": {
+          "address": {"type": "string", "pattern": "^0x[0-9a-fA-F]+$"},
+          "predicted_name": {"type": "string", "minLength": 1, "maxLength": 32768},
+          "authoritative_names": {
+            "type": "array",
+            "uniqueItems": true,
+            "items": {"type": "string", "minLength": 1, "maxLength": 32768}
+          },
+          "gradable": {"type": "boolean"},
+          "ungradable_reason": {"type": "string", "minLength": 1, "maxLength": 1000}
+        }
+      }
+    }
+  }
+}

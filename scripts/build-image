@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+repo_root="$(cd -- "${script_dir}/.." && pwd)"
+image_name=${ZION_EVAL_IMAGE:-zion-function-eval:local}
+ida_source=${ZION_IDA_INSTALL_DIR:-${IDA_INSTALL_DIR:-}}
+
+if [[ ! -d $ida_source || ! -f $ida_source/libidalib.so ]]; then
+    local_ida=/home/mahaloz/ctf/tools/idapro_9.2
+    if [[ -f $local_ida/libidalib.so ]]; then
+        ida_source=$local_ida
+    fi
+fi
+
+if [[ ! -x $ida_source/idat || ! -f $ida_source/libidalib.so ]]; then
+    echo "IDA Pro installation not found." >&2
+    echo "Set ZION_IDA_INSTALL_DIR to the IDA Pro 9.2 installation directory." >&2
+    exit 1
+fi
+if [[ ! -f $ida_source/idapro.hexlic ]]; then
+    echo "IDA license is missing from $ida_source/idapro.hexlic" >&2
+    exit 1
+fi
+
+ida_source="$(cd -- "$ida_source" && pwd)"
+exec docker buildx build \
+    --load \
+    --platform linux/amd64 \
+    --build-context "ida-pro=${ida_source}" \
+    --tag "$image_name" \
+    "$@" \
+    "$repo_root"
