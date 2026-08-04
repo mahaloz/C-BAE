@@ -1,4 +1,4 @@
-# Zion Function-Name Evaluation
+# Closed Binary Agent Evalation (C-BAE) 
 
 This repository evaluates how well an LLM can recover useful original-style
 function names from a large stripped binary. A reverser chooses functions and
