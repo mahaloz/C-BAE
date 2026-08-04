@@ -121,6 +121,34 @@ Batch runs use a versioned JSON matrix:
 
 Run it with `./scripts/zion-eval batch --matrix matrix.json`.
 
+## Evaluation dashboard
+
+The artifact-backed dashboard in `web/` summarizes exact and semantic recovery,
+modeled cost, and end-to-end runtime across completed runs. Each binary has a
+drill-down page with binary metadata, model/tool statistics, all submitted
+function names, private truth verdicts, pre-run IDA names, current IDA
+pseudocode, and the address-level commands and outputs preserved in the
+reverser's parent trace.
+
+Refresh its static data bundle after adding or regrading runs, then start it:
+
+```bash
+cd web
+npm install
+npm run data:generate
+npm run dev
+```
+
+The exporter reads completed run directories, the dataset manifest, and local
+binary sizes. It matches recorded token usage to any `*cost-summary.json` files
+under `runs/`; when providers do not report actual spend, the interface labels
+those values as API list-price equivalents. The generated dashboard bundle is
+safe to publish only when the included grading truth is intended for the site's
+audience.
+
+The GitHub Pages workflow publishes the static export at
+`https://mahaloz.github.io/C-BAE/` after dashboard changes land on `main`.
+
 ## Add a target
 
 Add another `[[targets]]` table to `mapping.toml` with:
